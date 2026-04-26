@@ -104,6 +104,7 @@ def train_model():
     model.fit(X_sc, y)
 
     return model, scaler
+model, scaler = train_model()
 
 # ── SIDEBAR ──────────────────────────────────────────────────────
 with st.sidebar:
