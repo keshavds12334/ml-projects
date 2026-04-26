@@ -66,30 +66,44 @@ def train_model():
     wlb         = np.random.randint(1, 5, n)
     distance    = np.random.randint(1, 30, n)
 
-    logit = (-2.5
-             + overtime * 1.8
-             - satisfaction * 0.5
-             - tenure * 0.12
-             - stock * 0.4
-             - wlb * 0.3
-             + distance * 0.04
-             - (income / 150000) * 1.2
-             - (age / 60) * 0.5
-             + np.random.normal(0, 0.5, n))
-    prob = 1 / (1 + np.exp(-logit))
-    y = (prob > 0.5).astype(int)
+    logit = (-1.0   # changed from -2.5 (important)
+             + overtime * 1.5
+             - satisfaction * 0.4
+             - tenure * 0.08
+             - stock * 0.3
+             - wlb * 0.25
+             + distance * 0.03
+             - (income / 150000) * 1.0
+             - (age / 60) * 0.4
+             + np.random.normal(0, 0.7, n))
 
-    X = pd.DataFrame({'Age':age,'MonthlyIncome':income,'OverTime':overtime,
-                      'JobSatisfaction':satisfaction,'YearsAtCompany':tenure,
-                      'StockOptionLevel':stock,'WorkLifeBalance':wlb,
-                      'DistanceFromHome':distance})
+    prob = 1 / (1 + np.exp(-logit))
+
+    # 🔥 FIX (main line)
+    y = np.random.binomial(1, prob)
+
+    # safety (never crash again)
+    if len(np.unique(y)) < 2:
+        y[0] = 1 - y[0]
+
+    X = pd.DataFrame({
+        'Age': age,
+        'MonthlyIncome': income,
+        'OverTime': overtime,
+        'JobSatisfaction': satisfaction,
+        'YearsAtCompany': tenure,
+        'StockOptionLevel': stock,
+        'WorkLifeBalance': wlb,
+        'DistanceFromHome': distance
+    })
+
     scaler = StandardScaler()
     X_sc   = scaler.fit_transform(X)
+
     model  = LogisticRegression(max_iter=500, random_state=42)
     model.fit(X_sc, y)
-    return model, scaler
 
-model, scaler = train_model()
+    return model, scaler
 
 # ── SIDEBAR ──────────────────────────────────────────────────────
 with st.sidebar:
