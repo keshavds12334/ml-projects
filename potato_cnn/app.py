@@ -3,7 +3,8 @@ import numpy as np
 from PIL import Image
 import io
 import json
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 st.set_page_config(page_title="Potato Disease Detector", page_icon="🥔", layout="wide")
 
@@ -56,8 +57,12 @@ div[data-testid="stSidebar"] { background:#071407;border-right:1px solid rgba(0,
 
 # ── GEMINI VISION PREDICTION ──────────────────────────────────────
 def predict_with_gemini(image: Image.Image):
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("models/gemini-1.5-flash-latest")
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+
+    # Convert PIL image to bytes for the new SDK
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=90)
+    img_bytes = buf.getvalue()
 
     prompt = """You are an expert plant pathologist specialising in potato leaf diseases.
 
@@ -79,7 +84,13 @@ JSON format (confidence values must sum to 1.0):
   "reasoning": "<one sentence explanation of key visual features you observed>"
 }"""
 
-    response = model.generate_content([prompt, image])
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=[
+            types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+            prompt,
+        ],
+    )
     raw = response.text.strip().replace("```json", "").replace("```", "").strip()
     result = json.loads(raw)
 
@@ -96,10 +107,10 @@ with st.sidebar:
     st.markdown("### 🌿 About the Model")
     st.markdown("---")
     st.markdown("""
-**Backend:** Gemini 1.5 Flash (Free)
+**Backend:** Gemini 2.0 Flash (Free)
 **Input:** Any resolution RGB
 **Classes:** 3
-**Model:** gemini-1.5-flash
+**Model:** gemini-2.0-flash
 **Accuracy:** High (vision LLM)
     """)
     st.markdown("---")
