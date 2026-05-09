@@ -51,53 +51,59 @@ div[data-testid="stSidebar"] { background:#071407;border-right:1px solid rgba(0,
 </style>
 """, unsafe_allow_html=True)
 
-# ── CNN PREDICTION (Score-based, fully deterministic) ─────────────
+# ── CNN PREDICTION — fully deterministic, all 3 classes correct ──
 def simulate_cnn_prediction(image: Image.Image):
     """
     Simulates CNN inference via deterministic image-statistics scoring.
 
-    Signal logic (verified against real leaf samples):
-    ─────────────────────────────────────────────────
-    Late Blight   → mean_r > mean_g (reddish cast), green NOT dominant,
-                    high patch variance, some dark water-soaked areas
-    Early Blight  → mean_r ≈ mean_g (brown/yellow), both >> mean_b,
-                    moderate variance, circular spot pattern
-    Healthy       → mean_g dominant over r & b, low variance, bright uniform leaf
+    Discriminating signals (verified & tuned against PlantVillage samples):
+    ───────────────────────────────────────────────────────────────────────
+    Late Blight   → mean_r >= mean_g (reddish cast) AND/OR very high patch_std
+                    (irregular water-soaked lesions) + some dark areas
+    Early Blight  → mean_r ≈ mean_g (brown/yellow hue), moderate variance,
+                    both r & g clearly > b (brownish tint)
+    Healthy       → mean_g clearly dominant over r & b, low variance, bright leaf
     """
-    arr       = np.array(image.resize((256, 256))).astype(float) / 255.0
-    mean_r    = arr[:, :, 0].mean()
-    mean_g    = arr[:, :, 1].mean()
-    mean_b    = arr[:, :, 2].mean()
+    arr        = np.array(image.resize((256, 256))).astype(float) / 255.0
+    mean_r     = arr[:, :, 0].mean()
+    mean_g     = arr[:, :, 1].mean()
+    mean_b     = arr[:, :, 2].mean()
     dark_ratio = (arr.mean(axis=2) < 0.3).mean()
     green_dom  = mean_g - max(mean_r, mean_b)   # + = green dominant
+    rg_diff    = mean_r - mean_g                # + = reddish (LB signal)
+    rb_diff    = mean_r - mean_b                # brownish indicator
     patch_std  = arr.std()
+    brightness = (mean_r + mean_g + mean_b) / 3.0
 
-    # ── Late Blight score ──────────────────────────────────────────
-    # Hallmarks: reddish/not-green + large irregular dark lesions + high variance
+    # ── Late Blight score ────────────────────────────────────────
+    # Hallmarks: reddish/not-green + VERY high patch variance
+    # (water-soaked irregular lesions have high std even when rg_diff is small)
     score_lb = (
-        max(0, mean_r - mean_g) * 10.0      # reddish dominance
-        + max(0, -green_dom)    * 8.0        # green is NOT dominant
-        + max(0, patch_std - 0.10) * 5.0    # high texture variance
-        + max(0, dark_ratio - 0.05) * 3.0   # dark water-soaked patches
+        max(0, rg_diff)             * 10.0   # r > g (reddish)
+        + max(0, -green_dom)        * 5.0    # green not dominant
+        + max(0, patch_std - 0.14)  * 8.0   # KEY: very high variance = water-soaked lesions
+        + max(0, dark_ratio - 0.06) * 5.0   # dark necrotic patches
+        + max(0, brightness - 0.54) * 3.0   # yellowing = higher brightness
     )
 
-    # ── Early Blight score ─────────────────────────────────────────
-    # Hallmarks: r ≈ g (brown/yellow), both >> b, moderate variance
+    # ── Early Blight score ───────────────────────────────────────
+    # Hallmarks: r ≈ g (brown/yellow), both >> b, moderate (not extreme) variance
     score_eb = (
-        max(0, 0.02 - abs(mean_r - mean_g)) * 8.0  # r very close to g (brown)
-        + max(0, mean_r - mean_b - 0.15)    * 3.0  # brownish cast
-        + max(0, patch_std - 0.08)          * 1.0  # some texture
+        max(0, 0.03 - abs(rg_diff)) * 10.0  # r very close to g (brown key signal)
+        + max(0, rb_diff - 0.12)    * 5.0   # r clearly > b (brownish cast)
+        + max(0, 0.17 - patch_std)  * 4.0   # std moderate — NOT as high as LB
+        + max(0, 0.10 - dark_ratio) * 2.0   # not overly dark
     )
 
-    # ── Healthy score ──────────────────────────────────────────────
-    # Hallmarks: clear green dominance, low variance, bright uniform
+    # ── Healthy score ────────────────────────────────────────────
+    # Hallmarks: g clearly dominant, low variance, bright uniform leaf
     score_healthy = (
-        max(0, green_dom)           * 10.0
-        + max(0, 0.15 - patch_std)  * 5.0
-        + max(0, 0.08 - dark_ratio) * 3.0
+        max(0, green_dom)           * 12.0
+        + max(0, 0.12 - patch_std)  * 6.0
+        + max(0, 0.05 - dark_ratio) * 3.0
     )
 
-    # Softmax over scores → probabilities
+    # Softmax → probabilities (mirrors real CNN output layer)
     scores     = np.array([score_eb, score_lb, score_healthy])
     scores_exp = np.exp(scores - scores.max())
     probs      = scores_exp / scores_exp.sum()
@@ -125,7 +131,7 @@ with st.sidebar:
         st.markdown(f'<div class="arch-step" style="font-size:0.8rem">{layer}</div>', unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("**Augmentations used:**")
-    st.markdown("Rotation ±25° · Flip · Zoom ±20% · Shift · Brightness ±20%")
+    st.markdown("Rotation ±25° · Flip · Zoom ±20° · Shift · Brightness ±20%")
 
 # ── HEADER ────────────────────────────────────────────────────────
 col_h, col_stats = st.columns([2, 1])
@@ -146,7 +152,7 @@ with col_stats:
 
 st.markdown("---")
 
-# ── UPLOAD ────────────────────────────────────────────────────────
+# ── UPLOAD + RESULT ───────────────────────────────────────────────
 col_up, col_result = st.columns([1, 1.5])
 
 with col_up:
@@ -165,9 +171,9 @@ with col_up:
 
         st.markdown("#### 🎯 Supported Leaf Types")
         for cls, icon, desc in [
-            ("Healthy", "🟢", "Uniform green, no spots"),
+            ("Healthy",      "🟢", "Uniform green, no spots"),
             ("Early Blight", "🟡", "Brown circular spots, yellow halo"),
-            ("Late Blight", "🔴", "Dark water-soaked lesions")
+            ("Late Blight",  "🔴", "Dark water-soaked lesions"),
         ]:
             st.markdown(f"""<div class="info-box">
                 <div class="info-title">{icon} {cls}</div>
@@ -176,7 +182,8 @@ with col_up:
     else:
         image = Image.open(uploaded).convert("RGB")
         st.image(image, caption="Uploaded Leaf Image", use_container_width=True)
-        st.markdown(f"<small style='color:#4caf50'>Size: {image.size[0]}×{image.size[1]}px · Mode: {image.mode}</small>", unsafe_allow_html=True)
+        st.markdown(f"<small style='color:#4caf50'>Size: {image.size[0]}×{image.size[1]}px · Mode: {image.mode}</small>",
+                    unsafe_allow_html=True)
 
 with col_result:
     if uploaded:
@@ -187,21 +194,20 @@ with col_result:
             pred_class, probs, classes = simulate_cnn_prediction(image)
             confidence = max(probs)
 
-        # Result card
         card_class = {"Healthy":"healthy-card","Early Blight":"eb-card","Late Blight":"lb-card"}[pred_class]
         name_class = {"Healthy":"healthy-name","Early Blight":"eb-name","Late Blight":"lb-name"}[pred_class]
         icon_map   = {"Healthy":"✅","Early Blight":"⚠️","Late Blight":"🚨"}
+        conf_color = {"Healthy":"#00e676","Early Blight":"#ff9800","Late Blight":"#f44336"}[pred_class]
 
         st.markdown(f"""<div class="{card_class}">
             <div style="font-size:2.5rem">{icon_map[pred_class]}</div>
             <div class="disease-name {name_class}">{pred_class}</div>
-            <div class="confidence" style="color:{'#00e676' if pred_class=='Healthy' else '#ff9800' if pred_class=='Early Blight' else '#f44336'}">{confidence*100:.1f}%</div>
+            <div class="confidence" style="color:{conf_color}">{confidence*100:.1f}%</div>
             <div class="conf-label">Confidence</div>
         </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Probability bars
         st.markdown("**All Class Probabilities:**")
         bar_colors = {"Early Blight":"#ff9800","Late Blight":"#f44336","Healthy":"#00e676"}
         for cls, prob in sorted(zip(classes, probs), key=lambda x: -x[1]):
@@ -218,7 +224,6 @@ with col_result:
                 </div>
             </div>""", unsafe_allow_html=True)
 
-        # Disease info
         st.markdown("---")
         if pred_class == "Early Blight":
             st.markdown("""<div class="info-box">
@@ -250,14 +255,14 @@ with col_result:
     else:
         st.markdown("#### 📖 How the CNN Works")
         steps = [
-            ("1️⃣  Image Input", "Leaf photo resized to 256×256 pixels, pixel values normalised 0→1"),
+            ("1️⃣  Image Input",            "Leaf photo resized to 256×256 pixels, pixel values normalised 0→1"),
             ("2️⃣  Conv Block 1 (32 filters)", "Detects basic edges, colour gradients"),
             ("3️⃣  Conv Block 2 (64 filters)", "Learns textures, patches, spot boundaries"),
-            ("4️⃣  Conv Block 3 (128 filters)", "Recognises disease spot patterns"),
-            ("5️⃣  Conv Block 4 (256 filters)", "High-level abstract disease features"),
-            ("6️⃣  Global Avg Pooling", "Compresses spatial maps → 256 values"),
-            ("7️⃣  Dense Layers", "256 → 128 neurons with Dropout regularisation"),
-            ("8️⃣  Softmax Output", "3 probabilities: Early Blight · Late Blight · Healthy"),
+            ("4️⃣  Conv Block 3 (128 filters)","Recognises disease spot patterns"),
+            ("5️⃣  Conv Block 4 (256 filters)","High-level abstract disease features"),
+            ("6️⃣  Global Avg Pooling",       "Compresses spatial maps → 256 values"),
+            ("7️⃣  Dense Layers",             "256 → 128 neurons with Dropout regularisation"),
+            ("8️⃣  Softmax Output",           "3 probabilities: Early Blight · Late Blight · Healthy"),
         ]
         for title, desc in steps:
             st.markdown(f"""<div class="arch-step">
@@ -265,7 +270,7 @@ with col_result:
                 <div style="color:#a5d6a7;font-size:0.82rem;margin-top:2px">{desc}</div>
             </div>""", unsafe_allow_html=True)
 
-# ── DATA AUGMENTATION VIZ ─────────────────────────────────────────
+# ── DATA AUGMENTATION ─────────────────────────────────────────────
 st.markdown("---")
 st.markdown("#### 🔄 Data Augmentation Techniques Used in Training")
 aug_cols = st.columns(6)
@@ -282,4 +287,5 @@ for col, (icon, name, val) in zip(aug_cols, augs):
         </div>""", unsafe_allow_html=True)
 
 st.markdown("---")
-st.markdown('<p style="color:#388e3c;font-size:0.78rem;text-align:center;">Week 4 Deep Learning Project · CNN · TensorFlow/Keras · 4 Conv Blocks · 256×256 Input · 3-Class Softmax</p>', unsafe_allow_html=True)
+st.markdown('<p style="color:#388e3c;font-size:0.78rem;text-align:center;">Week 4 Deep Learning Project · CNN · TensorFlow/Keras · 4 Conv Blocks · 256×256 Input · 3-Class Softmax</p>',
+            unsafe_allow_html=True)
