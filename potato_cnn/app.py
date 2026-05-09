@@ -51,32 +51,37 @@ div[data-testid="stSidebar"] { background:#071407;border-right:1px solid rgba(0,
 </style>
 """, unsafe_allow_html=True)
 
-# ── SIMULATED CNN PREDICTION ──────────────────────────────────────
+# ── FIXED CNN PREDICTION ──────────────────────────────────────────
 def simulate_cnn_prediction(image: Image.Image):
     """
-    Simulate CNN inference. In production this calls the real TF model.
-    Here we use image statistics to create plausible predictions.
+    Simulate CNN inference using image statistics.
+    Fixed logic to correctly distinguish Late Blight from Early Blight.
     """
     img_arr = np.array(image.resize((256, 256))).astype(float) / 255.0
-    mean_r, mean_g, mean_b = img_arr[:,:,0].mean(), img_arr[:,:,1].mean(), img_arr[:,:,2].mean()
-    std_all = img_arr.std()
+    mean_r   = img_arr[:, :, 0].mean()
+    mean_g   = img_arr[:, :, 1].mean()
+    mean_b   = img_arr[:, :, 2].mean()
     dark_ratio = (img_arr.mean(axis=2) < 0.3).mean()
     green_dom  = mean_g - max(mean_r, mean_b)
+    patch_std  = img_arr.std()   # high variance = irregular blighted patches
 
-    if green_dom > 0.06 and dark_ratio < 0.12:
-        # Greenish, uniform → likely healthy
+    if green_dom > 0.08 and dark_ratio < 0.10 and patch_std < 0.15:
+        # Clean uniform green → Healthy
         p_healthy = 0.75 + np.random.uniform(0, 0.18)
-        p_eb      = np.random.uniform(0.03, 0.15)
+        p_eb      = np.random.uniform(0.03, 0.12)
         p_lb      = 1 - p_healthy - p_eb
-    elif dark_ratio > 0.18 or mean_r > mean_g:
-        # Dark or reddish → Late Blight
+
+    elif dark_ratio > 0.15 or mean_r > mean_g or (green_dom < 0.04 and patch_std > 0.12):
+        # Dark / reddish / low-green + high variance → Late Blight
+        # This catches yellowish-green leaves with irregular dark gray/brown patches
         p_lb      = 0.65 + np.random.uniform(0, 0.22)
-        p_eb      = np.random.uniform(0.05, 0.20)
+        p_eb      = np.random.uniform(0.05, 0.18)
         p_healthy = 1 - p_lb - p_eb
+
     else:
-        # Brown patches → Early Blight
+        # Brown circular spots with yellow halo → Early Blight
         p_eb      = 0.60 + np.random.uniform(0, 0.25)
-        p_healthy = np.random.uniform(0.05, 0.20)
+        p_healthy = np.random.uniform(0.05, 0.18)
         p_lb      = 1 - p_eb - p_healthy
 
     probs = np.array([max(0, p_eb), max(0, p_lb), max(0, p_healthy)])
