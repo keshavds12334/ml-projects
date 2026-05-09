@@ -57,7 +57,7 @@ div[data-testid="stSidebar"] { background:#071407;border-right:1px solid rgba(0,
 # ── GEMINI VISION PREDICTION ──────────────────────────────────────
 def predict_with_gemini(image: Image.Image):
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("models/gemini-1.5-flash-latest")
 
     prompt = """You are an expert plant pathologist specialising in potato leaf diseases.
 
