@@ -39,42 +39,42 @@ div[data-testid="stSidebar"]{ background:#071407;border-right:1px solid rgba(0,2
 """, unsafe_allow_html=True)
 
 
-# ── PREDICTION ENGINE v3 ─────────────────────────────────────────────
+# ── PREDICTION ENGINE v4 (relative-darkness LB) ──────────────────────
 def predict_disease(image: Image.Image):
     """
-    v3 — fixes all 3 observed failure modes:
+    v4 — key insight from pixel analysis of real late.jpg:
 
-    BUG 1 (fixed): Dark green veins/shadows were triggering Late Blight.
-        Old rule:  brightness < 0.22  (catches veins too)
-        New rule:  brightness < 0.22 AND G is NOT dominant over R by >0.05
-        Real LB lesions are grayish/brownish-dark (G ≈ R ≈ B, all very low).
-        Dark green veins have G clearly > R — excluded by new rule.
+    Late Blight lesions on green leaves appear as DARK OLIVE patches.
+    They are darker than surrounding leaf but G can still be >= R.
+    So any rule that excludes "G > R" will miss real LB lesions.
 
-    BUG 2 (fixed): Late Blight dark-brown lesions (R slightly > G) were
-        being caught by the brown_mask (Early Blight) instead of dark_mask.
-        New rule:  LB dark pixels require brightness < 0.28 AND low saturation
-        (max_channel - min_channel < 0.12), meaning near-greyscale dark.
+    Solution: RELATIVE darkness.
+    Instead of asking "is this pixel dark in absolute terms?",
+    ask "is this patch significantly darker than the leaf average?"
+    A LB lesion sits at ~68% of surrounding leaf brightness.
+    A normal vein/shadow sits at ~78-85% of leaf brightness.
+    Threshold: patch mean < 72% of whole-image mean brightness → LB suspect.
 
-    BUG 3 (fixed): patch_dark_max too easily triggered by a single vein patch.
-        Now requires patch to be ≥ 25% TRUE dark (non-green-dark) pixels.
+    EB detection: unchanged (brown/yellow spots, patch-level max).
+    Healthy: no significant relative-dark patches AND high green ratio.
     """
     img = image.resize((256, 256)).convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
 
     R, G, B    = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
     brightness = (R + G + B) / 3.0
-    sat        = arr.max(axis=2) - arr.min(axis=2)   # colour saturation
 
-    # ── EARLY BLIGHT features ──────────────────────────────────────
+    # Whole-image mean brightness (used as reference for relative darkness)
+    img_mean_brightness = float(brightness.mean())
 
-    # Brown spots: R dominant, B lowest, mid brightness
+    # ── EARLY BLIGHT — brown spots + yellow halos ──────────────────
+
     brown_mask = (
         (R > G + 0.03) & (R > B + 0.08) &
         (brightness > 0.15) & (brightness < 0.75)
     )
-    brown_px = float(brown_mask.mean())
+    brown_px  = float(brown_mask.mean())
 
-    # Yellow halo: warm yellow ring around EB spots
     yellow_mask = (
         (R > 0.42) & (G > 0.38) & (B < 0.32) &
         (R > B + 0.15) & (G > B + 0.10)
@@ -83,25 +83,19 @@ def predict_disease(image: Image.Image):
 
     eb_signal = brown_px + yellow_px * 0.5
 
-    # ── LATE BLIGHT features (v3 — vein-safe) ──────────────────────
+    # ── LATE BLIGHT — adaptive / relative darkness ─────────────────
+    # Dynamic threshold: 72% of image mean, capped between 0.15–0.33
+    # This adapts to both dark-background and bright-background photos
+    lb_thresh  = float(np.clip(img_mean_brightness * 0.72, 0.15, 0.33))
+    lb_abs_mask = brightness < lb_thresh       # relatively dark pixels
+    lb_dark_px  = float(lb_abs_mask.mean())
 
-    # TRUE dark pixels = dark AND not green-dominant
-    # This excludes: dark green veins (G >> R), leaf shadows (G > R)
-    # This includes: LB lesions (grayish-brown, G ≈ R ≈ B, all very low)
-    lb_dark_mask = (
-        (brightness < 0.28) &               # dark enough
-        ~(G > R + 0.05) &                   # NOT green-dominant (excludes veins)
-        (sat < 0.18)                         # low saturation = near-grey/brown (not vivid green)
-    )
-    lb_dark_px = float(lb_dark_mask.mean())
+    # Very dark (near-black) — strongest LB signal regardless
+    very_dark_px = float((brightness < 0.13).mean())
 
-    # Very dark, near-black pixels (strongest LB signal — always non-green)
-    very_dark_mask = (brightness < 0.13)
-    very_dark_px   = float(very_dark_mask.mean())
+    lb_signal = lb_dark_px + very_dark_px * 0.5
 
-    lb_signal = lb_dark_px + very_dark_px * 0.8
-
-    # ── GREEN / HEALTHY features ────────────────────────────────────
+    # ── GREEN / HEALTHY ─────────────────────────────────────────────
     green_mask = (
         (G > R + 0.04) & (G > B + 0.04) &
         (brightness > 0.18) & (brightness < 0.90)
@@ -109,72 +103,70 @@ def predict_disease(image: Image.Image):
     green_px = float(green_mask.mean())
 
     # ── Texture ─────────────────────────────────────────────────────
-    patches_std = [
-        arr[y:y + 32, x:x + 32].std()
+    texture = float(np.mean([
+        arr[y:y+32, x:x+32].std()
         for y in range(0, 224, 32)
         for x in range(0, 224, 32)
-    ]
-    texture = float(np.mean(patches_std))
+    ]))
 
-    # ── Patch-level spot detection ───────────────────────────────────
-    # Scan 16×16 patches. Record max brown ratio and max TRUE-dark ratio.
-    # "True dark" patch must have ≥25% vein-safe dark pixels to count.
+    # ── Patch-level detection (16×16 patches) ───────────────────────
+    # EB: max brown ratio in any single patch
+    # LB: max relative-dark ratio in any patch where patch_mean < 72% of image_mean
+    #     AND the patch must clear a 20% dark-pixel threshold (avoids single veins)
     patch_brown_max  = 0.0
-    patch_lbdark_max = 0.0
+    patch_lb_max     = 0.0
 
     for y in range(0, 240, 16):
         for x in range(0, 240, 16):
             p  = arr[y:y+16, x:x+16]
             pr, pg, pb = p[:,:,0], p[:,:,1], p[:,:,2]
             pb_bright  = (pr + pg + pb) / 3.0
-            pb_sat     = p.max(axis=2) - p.min(axis=2)
+            patch_mean = float(pb_bright.mean())
 
-            # Brown patch (EB)
+            # EB: brown pixels in patch
             p_brown = float(
                 ((pr > pg + 0.03) & (pr > pb + 0.08) &
                  (pb_bright > 0.15) & (pb_bright < 0.75)).mean()
             )
+            if p_brown > patch_brown_max:
+                patch_brown_max = p_brown
 
-            # Vein-safe dark patch (LB)
-            p_lb_dark = float(
-                ((pb_bright < 0.28) &
-                 ~(pg > pr + 0.05) &
-                 (pb_sat < 0.18)).mean()
-            )
+            # LB: patch that is relatively much darker than image average
+            # ratio < 0.72 means this patch is ≥28% darker than average leaf
+            if patch_mean > 0.05:   # skip near-black border/shadow patches
+                ratio = patch_mean / img_mean_brightness
+                p_lb_dark = float((pb_bright < lb_thresh).mean())
+                if ratio < 0.72 and p_lb_dark > 0.20:
+                    if p_lb_dark > patch_lb_max:
+                        patch_lb_max = p_lb_dark
 
-            if p_brown   > patch_brown_max:  patch_brown_max  = p_brown
-            # Only count LB patch if it clears the 25% threshold
-            if p_lb_dark > 0.25 and p_lb_dark > patch_lbdark_max:
-                patch_lbdark_max = p_lb_dark
-
-    # ── Class scores ────────────────────────────────────────────────
+    # ── Class scores ─────────────────────────────────────────────────
     eb_score = (
-          eb_signal         * 6.0
-        + patch_brown_max   * 8.0
-        + texture           * 1.5
-        - green_px          * 2.0
-        - lb_signal         * 1.0
+          eb_signal        * 6.0
+        + patch_brown_max  * 8.0
+        + texture          * 1.5
+        - green_px         * 2.0
+        - lb_signal        * 0.5
     )
 
     lb_score = (
-          lb_signal         * 7.0
-        + patch_lbdark_max  * 8.0
-        + texture           * 1.5
-        - green_px          * 4.0    # green leaf strongly counters LB
-        - eb_signal         * 1.5
+          lb_signal        * 5.0
+        + patch_lb_max     * 9.0    # relative dark patch is strongest LB signal
+        + texture          * 1.5
+        - green_px         * 3.5
+        - eb_signal        * 2.0
     )
 
-    # Healthy is penalised by ANY real disease signal
     healthy_score = (
-          green_px          * 6.0
-        - eb_signal         * 9.0
-        - patch_brown_max   * 10.0
-        - lb_signal         * 7.0
-        - patch_lbdark_max  * 9.0
-        - texture           * 1.0
+          green_px         * 6.0
+        - eb_signal        * 9.0
+        - patch_brown_max  * 10.0
+        - patch_lb_max     * 10.0   # any dark patch kills healthy
+        - lb_signal        * 5.0
+        - texture          * 1.0
     )
 
-    # ── Softmax ─────────────────────────────────────────────────────
+    # ── Softmax ──────────────────────────────────────────────────────
     raw = np.array([eb_score, lb_score, healthy_score], dtype=np.float64)
     raw -= raw.max()
     exp_ = np.exp(raw * 3.5)
@@ -187,7 +179,7 @@ def predict_disease(image: Image.Image):
     return classes[pred_idx], probs, classes
 
 
-# ── SIDEBAR ─────────────────────────────────────────────────────────
+# ── SIDEBAR ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🌿 About the Model")
     st.markdown("---")
@@ -225,7 +217,7 @@ with st.sidebar:
     """)
 
 
-# ── HEADER ──────────────────────────────────────────────────────────
+# ── HEADER ───────────────────────────────────────────────────────────
 col_h, col_stats = st.columns([2, 1])
 with col_h:
     st.markdown(
@@ -253,7 +245,7 @@ with col_stats:
 st.markdown("---")
 
 
-# ── MAIN AREA ────────────────────────────────────────────────────────
+# ── MAIN AREA ─────────────────────────────────────────────────────────
 col_up, col_res = st.columns([1, 1.5])
 
 with col_up:
@@ -405,7 +397,7 @@ with col_res:
             </div>""", unsafe_allow_html=True)
 
 
-# ── AUGMENTATION STRIP ───────────────────────────────────────────────
+# ── AUGMENTATION STRIP ────────────────────────────────────────────────
 st.markdown("---")
 st.markdown("#### 🔄 Training Augmentations Applied")
 aug_cols = st.columns(6)
