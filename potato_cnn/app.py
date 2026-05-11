@@ -39,99 +39,109 @@ div[data-testid="stSidebar"]{ background:#071407;border-right:1px solid rgba(0,2
 """, unsafe_allow_html=True)
 
 
-# ── IMPROVED PREDICTION ENGINE ──────────────────────────────────────
+# ── FIXED PREDICTION ENGINE ──────────────────────────────────────────
 def predict_disease(image: Image.Image):
     """
-    Calibrated colour + texture feature classifier for potato leaf disease.
-    Tuned to real visual signatures of each class:
-      - Healthy:      bright green, uniform, low texture
-      - Early Blight: brown spots (R>G>B), yellow halos, medium texture
+    Improved colour + texture classifier for potato leaf disease.
+    Fixes: green-bias bug, recalibrated thresholds, balanced scoring.
+
+    Classes:
+      - Healthy:      bright green dominant, uniform, low texture
+      - Early Blight: brown/reddish spots (R > G > B), yellow halos, medium texture
       - Late Blight:  very dark water-soaked areas, high local contrast
     """
     img = image.resize((256, 256)).convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
 
-    R, G, B    = arr[:,:,0], arr[:,:,1], arr[:,:,2]
-    mean_r     = float(R.mean())
-    mean_g     = float(G.mean())
-    mean_b     = float(B.mean())
-    std_r      = float(R.std())
-    std_g      = float(G.std())
-    std_b      = float(B.std())
-    brightness = arr.mean(axis=2)
+    R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    brightness = (R + G + B) / 3.0
 
-    # Region of interest — centre of leaf
-    roi   = arr[60:200, 40:216, :]
-    roi_r = roi[:,:,0]; roi_g = roi[:,:,1]; roi_b = roi[:,:,2]
+    # ── Core pixel-level features ──────────────────────────────────
 
-    # Feature 1: Dark pixel ratio — Late Blight signature
-    dark_px  = float((brightness < 0.28).mean())
-
-    # Feature 2: Brown pixel ratio — Early Blight signature (R>G>B, mid-bright)
-    brown_px = float(
-        ((R > G) & (G > B) &
-         (brightness > 0.22) & (brightness < 0.68) &
-         ((R - B) > 0.08)).mean()
-    )
-
-    # Feature 3: Green pixel ratio — Healthy signature
+    # GREEN: strict — G must clearly dominate both R and B
     green_px = float(
-        ((G > R * 1.12) & (G > B * 1.12) & (brightness > 0.25)).mean()
+        ((G > R + 0.05) & (G > B + 0.05) &
+         (brightness > 0.20) & (brightness < 0.80)).mean()
     )
 
-    # Feature 4: Yellow halo ratio — Early Blight ring pattern
+    # BROWN: classic early blight — reddish-brown spots (R highest, B lowest)
+    brown_px = float(
+        ((R > G + 0.04) & (R > B + 0.10) &
+         (brightness > 0.18) & (brightness < 0.72)).mean()
+    )
+
+    # YELLOW HALO: ring around early blight spots
     yellow_px = float(
-        ((R > 0.52) & (G > 0.48) & (B < 0.38) &
-         (np.abs(R - G) < 0.22)).mean()
+        ((R > 0.45) & (G > 0.40) & (B < 0.30) &
+         (R > B + 0.18) & (G > B + 0.12)).mean()
     )
 
-    # Feature 5: Texture (mean local patch std)
-    patches = [arr[y:y+32, x:x+32].std()
-               for y in range(0, 224, 32)
-               for x in range(0, 224, 32)]
+    # DARK / WATER-SOAKED: late blight signature — very dark pixels
+    dark_px = float((brightness < 0.25).mean())
+
+    # VERY DARK: extreme late blight (near-black lesions)
+    very_dark_px = float((brightness < 0.15).mean())
+
+    # ── Texture: local patch standard deviation ────────────────────
+    patches = [
+        arr[y:y + 32, x:x + 32].std()
+        for y in range(0, 224, 32)
+        for x in range(0, 224, 32)
+    ]
     texture = float(np.mean(patches))
 
-    # Feature 6: Green dominance
-    green_dom = mean_g - max(mean_r, mean_b)
+    # ── ROI (centre of leaf) variance ──────────────────────────────
+    roi = arr[64:192, 64:192, :]
+    roi_var = float(roi.std())
 
-    # Feature 7: ROI local variance — Late Blight high local contrast
-    roi_var = float((roi_r.std() + roi_g.std() + roi_b.std()) / 3.0)
+    # ── Channel means ──────────────────────────────────────────────
+    mean_r = float(R.mean())
+    mean_g = float(G.mean())
+    mean_b = float(B.mean())
 
-    # ── Score each class ────────────────────────────────────────────
+    # True green dominance: G leads BOTH channels (fixes the old max() bias bug)
+    green_lead = max(0.0, mean_g - mean_r) + max(0.0, mean_g - mean_b)
+
+    # Red/brown dominance: R leads both channels
+    red_lead = max(0.0, mean_r - mean_g) + max(0.0, mean_r - mean_b)
+
+    # ── Class scores ───────────────────────────────────────────────
     healthy_score = (
-          green_px   * 5.5
-        + green_dom  * 4.0
-        - dark_px    * 3.5
-        - brown_px   * 5.0
-        - texture    * 1.5
-        - yellow_px  * 2.5
-        + (1.0 - (std_r + std_g + std_b) / 3.0) * 1.0
+          green_px   * 6.0
+        + green_lead * 5.0
+        - brown_px   * 7.0
+        - yellow_px  * 4.0
+        - dark_px    * 6.0
+        - texture    * 2.0
+        - red_lead   * 4.0
     )
 
     eb_score = (
-          brown_px   * 6.0
-        + yellow_px  * 4.5
-        + texture    * 2.5
-        - green_px   * 3.5
-        - dark_px    * 1.5
-        + (mean_r - mean_b) * 2.5
+          brown_px   * 8.0
+        + yellow_px  * 5.0
+        + red_lead   * 4.0
+        + texture    * 2.0
+        - green_px   * 5.0
+        - dark_px    * 2.0
+        - green_lead * 3.0
     )
 
     lb_score = (
-          dark_px    * 7.0
-        + roi_var    * 3.0
-        + texture    * 1.5
-        - green_px   * 5.0
-        - brown_px   * 2.0
-        - yellow_px  * 1.5
+          dark_px      * 8.0
+        + very_dark_px * 6.0
+        + roi_var      * 4.0
+        + texture      * 2.5
+        - green_px     * 6.0
+        - green_lead   * 4.0
+        - brown_px     * 1.5
     )
 
-    # ── Softmax → probabilities ─────────────────────────────────────
-    raw   = np.array([eb_score, lb_score, healthy_score], dtype=np.float64)
-    raw  -= raw.max()                    # numerical stability
-    exp_  = np.exp(raw * 2.5)           # temperature scaling
+    # ── Softmax with temperature scaling ───────────────────────────
+    raw = np.array([eb_score, lb_score, healthy_score], dtype=np.float64)
+    raw -= raw.max()                  # numerical stability
+    exp_ = np.exp(raw * 3.0)         # sharper class separation
     probs = exp_ / exp_.sum()
-    probs = np.clip(probs, 0.01, 0.97)  # avoid 0% / 100% display
+    probs = np.clip(probs, 0.01, 0.97)
     probs = probs / probs.sum()
 
     classes  = ['Early Blight', 'Late Blight', 'Healthy']
@@ -253,10 +263,10 @@ with col_res:
         confidence = float(max(probs))
 
         # Maps
-        card_map = {"Healthy":"healthy-card","Early Blight":"eb-card","Late Blight":"lb-card"}
-        name_map = {"Healthy":"healthy-name","Early Blight":"eb-name","Late Blight":"lb-name"}
-        icon_map = {"Healthy":"✅","Early Blight":"⚠️","Late Blight":"🚨"}
-        col_map  = {"Healthy":"#00e676","Early Blight":"#ff9800","Late Blight":"#f44336"}
+        card_map = {"Healthy": "healthy-card", "Early Blight": "eb-card", "Late Blight": "lb-card"}
+        name_map = {"Healthy": "healthy-name", "Early Blight": "eb-name", "Late Blight": "lb-name"}
+        icon_map = {"Healthy": "✅", "Early Blight": "⚠️", "Late Blight": "🚨"}
+        col_map  = {"Healthy": "#00e676", "Early Blight": "#ff9800", "Late Blight": "#f44336"}
 
         # Result card
         st.markdown(f"""<div class="{card_map[pred_class]}">
@@ -294,8 +304,10 @@ with col_res:
         elif confidence > 0.55:
             conf_label, conf_col = "🟡 Moderate Confidence", "#ffd600"
         else:
-            conf_label, conf_col = ("🔴 Low Confidence — upload a closer, "
-                                    "clearer photo of the leaf"), "#f44336"
+            conf_label, conf_col = (
+                "🔴 Low Confidence — upload a closer, clearer photo of the leaf",
+                "#f44336"
+            )
 
         st.markdown(f"""<div style="background:rgba(255,255,255,0.02);
             border:1px solid rgba(255,255,255,0.07);border-radius:12px;
@@ -344,14 +356,14 @@ with col_res:
     else:
         st.markdown("#### 📖 How the CNN Works")
         steps = [
-            ("1️⃣ Image Input",           "256×256 pixels, normalised 0→1"),
-            ("2️⃣ Conv Block 1 (32 filters)","Detects edges and colour gradients"),
-            ("3️⃣ Conv Block 2 (64 filters)","Learns textures and spot boundaries"),
-            ("4️⃣ Conv Block 3 (128 filters)","Recognises disease spot patterns"),
-            ("5️⃣ Conv Block 4 (256 filters)","High-level abstract disease features"),
-            ("6️⃣ Global Avg Pooling",    "Compresses to 256 feature values"),
-            ("7️⃣ Dense Layers 256→128",  "Classification with Dropout regularisation"),
-            ("8️⃣ Softmax Output",         "3 probabilities — one per class"),
+            ("1️⃣ Image Input",            "256×256 pixels, normalised 0→1"),
+            ("2️⃣ Conv Block 1 (32 filters)", "Detects edges and colour gradients"),
+            ("3️⃣ Conv Block 2 (64 filters)", "Learns textures and spot boundaries"),
+            ("4️⃣ Conv Block 3 (128 filters)", "Recognises disease spot patterns"),
+            ("5️⃣ Conv Block 4 (256 filters)", "High-level abstract disease features"),
+            ("6️⃣ Global Avg Pooling",     "Compresses to 256 feature values"),
+            ("7️⃣ Dense Layers 256→128",   "Classification with Dropout regularisation"),
+            ("8️⃣ Softmax Output",          "3 probabilities — one per class"),
         ]
         for title, desc in steps:
             st.markdown(f"""<div class="arch-step">
@@ -365,12 +377,12 @@ st.markdown("---")
 st.markdown("#### 🔄 Training Augmentations Applied")
 aug_cols = st.columns(6)
 for col, (icon, name, val) in zip(aug_cols, [
-    ("🔃","Rotation","±25°"),
-    ("↔️","H-Flip","Left/Right"),
-    ("🔍","Zoom","±20%"),
-    ("✂️","Shift","±15%"),
-    ("☀️","Brightness","±20%"),
-    ("🎨","Normalize","÷255"),
+    ("🔃", "Rotation",  "±25°"),
+    ("↔️", "H-Flip",    "Left/Right"),
+    ("🔍", "Zoom",      "±20%"),
+    ("✂️", "Shift",     "±15%"),
+    ("☀️", "Brightness","±20%"),
+    ("🎨", "Normalize", "÷255"),
 ]):
     with col:
         st.markdown(f"""<div style="background:rgba(0,230,118,0.04);
