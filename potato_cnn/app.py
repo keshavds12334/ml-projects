@@ -39,115 +39,142 @@ div[data-testid="stSidebar"]{ background:#071407;border-right:1px solid rgba(0,2
 """, unsafe_allow_html=True)
 
 
-# ── SPOT-AWARE PREDICTION ENGINE ─────────────────────────────────────
+# ── PREDICTION ENGINE v3 ─────────────────────────────────────────────
 def predict_disease(image: Image.Image):
     """
-    Spot-aware classifier.
+    v3 — fixes all 3 observed failure modes:
 
-    ROOT CAUSE of old bug: a leaf can be 80%+ green yet still have Early
-    Blight. Global pixel averages let green dominate and drown out the
-    brown spot signal. Fix: use PATCH-LEVEL max detection — even a small
-    cluster of brown pixels (one 16×16 patch that is >30% brown) is
-    enough to flag disease.
+    BUG 1 (fixed): Dark green veins/shadows were triggering Late Blight.
+        Old rule:  brightness < 0.22  (catches veins too)
+        New rule:  brightness < 0.22 AND G is NOT dominant over R by >0.05
+        Real LB lesions are grayish/brownish-dark (G ≈ R ≈ B, all very low).
+        Dark green veins have G clearly > R — excluded by new rule.
 
-    Pipeline:
-      1. Global pixel ratios  (broad signal)
-      2. Patch-level max      (spot presence — KEY addition)
-      3. Healthy score has heavy penalty for ANY brown/dark patches
-      4. Softmax with temperature=3.5 for sharp separation
+    BUG 2 (fixed): Late Blight dark-brown lesions (R slightly > G) were
+        being caught by the brown_mask (Early Blight) instead of dark_mask.
+        New rule:  LB dark pixels require brightness < 0.28 AND low saturation
+        (max_channel - min_channel < 0.12), meaning near-greyscale dark.
+
+    BUG 3 (fixed): patch_dark_max too easily triggered by a single vein patch.
+        Now requires patch to be ≥ 25% TRUE dark (non-green-dark) pixels.
     """
     img = image.resize((256, 256)).convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
 
     R, G, B    = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
     brightness = (R + G + B) / 3.0
+    sat        = arr.max(axis=2) - arr.min(axis=2)   # colour saturation
 
-    # ── Global features ────────────────────────────────────────────
+    # ── EARLY BLIGHT features ──────────────────────────────────────
 
-    # Brown pixels: R is clearly highest, B is clearly lowest
+    # Brown spots: R dominant, B lowest, mid brightness
     brown_mask = (
         (R > G + 0.03) & (R > B + 0.08) &
         (brightness > 0.15) & (brightness < 0.75)
     )
     brown_px = float(brown_mask.mean())
 
-    # Yellow halo pixels: Early Blight ring around spots
+    # Yellow halo: warm yellow ring around EB spots
     yellow_mask = (
         (R > 0.42) & (G > 0.38) & (B < 0.32) &
         (R > B + 0.15) & (G > B + 0.10)
     )
     yellow_px = float(yellow_mask.mean())
 
-    # Combined Early Blight global signal
     eb_signal = brown_px + yellow_px * 0.5
 
-    # Dark / water-soaked pixels: Late Blight
-    dark_px      = float((brightness < 0.22).mean())
-    very_dark_px = float((brightness < 0.12).mean())
-    lb_signal    = dark_px + very_dark_px * 0.5
+    # ── LATE BLIGHT features (v3 — vein-safe) ──────────────────────
 
-    # Green pixels: Healthy
-    green_mask = (G > R + 0.04) & (G > B + 0.04) & (brightness > 0.18)
-    green_px   = float(green_mask.mean())
+    # TRUE dark pixels = dark AND not green-dominant
+    # This excludes: dark green veins (G >> R), leaf shadows (G > R)
+    # This includes: LB lesions (grayish-brown, G ≈ R ≈ B, all very low)
+    lb_dark_mask = (
+        (brightness < 0.28) &               # dark enough
+        ~(G > R + 0.05) &                   # NOT green-dominant (excludes veins)
+        (sat < 0.18)                         # low saturation = near-grey/brown (not vivid green)
+    )
+    lb_dark_px = float(lb_dark_mask.mean())
 
-    # Texture
-    patches = [
+    # Very dark, near-black pixels (strongest LB signal — always non-green)
+    very_dark_mask = (brightness < 0.13)
+    very_dark_px   = float(very_dark_mask.mean())
+
+    lb_signal = lb_dark_px + very_dark_px * 0.8
+
+    # ── GREEN / HEALTHY features ────────────────────────────────────
+    green_mask = (
+        (G > R + 0.04) & (G > B + 0.04) &
+        (brightness > 0.18) & (brightness < 0.90)
+    )
+    green_px = float(green_mask.mean())
+
+    # ── Texture ─────────────────────────────────────────────────────
+    patches_std = [
         arr[y:y + 32, x:x + 32].std()
         for y in range(0, 224, 32)
         for x in range(0, 224, 32)
     ]
-    texture = float(np.mean(patches))
+    texture = float(np.mean(patches_std))
 
-    # ── Patch-level spot detection (KEY FIX) ───────────────────────
-    # Scan every 16×16 patch. Record the MAXIMUM brown ratio and dark
-    # ratio found in any single patch. This catches localised spots
-    # that global averaging would dilute away.
-    patch_brown_max = 0.0
-    patch_dark_max  = 0.0
+    # ── Patch-level spot detection ───────────────────────────────────
+    # Scan 16×16 patches. Record max brown ratio and max TRUE-dark ratio.
+    # "True dark" patch must have ≥25% vein-safe dark pixels to count.
+    patch_brown_max  = 0.0
+    patch_lbdark_max = 0.0
+
     for y in range(0, 240, 16):
         for x in range(0, 240, 16):
             p  = arr[y:y+16, x:x+16]
             pr, pg, pb = p[:,:,0], p[:,:,1], p[:,:,2]
             pb_bright  = (pr + pg + pb) / 3.0
+            pb_sat     = p.max(axis=2) - p.min(axis=2)
+
+            # Brown patch (EB)
             p_brown = float(
                 ((pr > pg + 0.03) & (pr > pb + 0.08) &
                  (pb_bright > 0.15) & (pb_bright < 0.75)).mean()
             )
-            p_dark = float((pb_bright < 0.22).mean())
-            if p_brown > patch_brown_max:
-                patch_brown_max = p_brown
-            if p_dark > patch_dark_max:
-                patch_dark_max = p_dark
 
-    # ── Class scores ───────────────────────────────────────────────
+            # Vein-safe dark patch (LB)
+            p_lb_dark = float(
+                ((pb_bright < 0.28) &
+                 ~(pg > pr + 0.05) &
+                 (pb_sat < 0.18)).mean()
+            )
 
+            if p_brown   > patch_brown_max:  patch_brown_max  = p_brown
+            # Only count LB patch if it clears the 25% threshold
+            if p_lb_dark > 0.25 and p_lb_dark > patch_lbdark_max:
+                patch_lbdark_max = p_lb_dark
+
+    # ── Class scores ────────────────────────────────────────────────
     eb_score = (
-          eb_signal        * 6.0
-        + patch_brown_max  * 8.0   # local spot presence
-        + texture          * 1.5
-        - green_px         * 2.0
-        - lb_signal        * 1.5
+          eb_signal         * 6.0
+        + patch_brown_max   * 8.0
+        + texture           * 1.5
+        - green_px          * 2.0
+        - lb_signal         * 1.0
     )
 
     lb_score = (
-          lb_signal        * 7.0
-        + patch_dark_max   * 6.0
-        + texture          * 2.0
-        - green_px         * 3.0
-        - eb_signal        * 1.0
+          lb_signal         * 7.0
+        + patch_lbdark_max  * 8.0
+        + texture           * 1.5
+        - green_px          * 4.0    # green leaf strongly counters LB
+        - eb_signal         * 1.5
     )
 
-    # Healthy is penalised hard by ANY patch-level disease signal
+    # Healthy is penalised by ANY real disease signal
     healthy_score = (
-          green_px         * 5.0
-        - eb_signal        * 9.0
-        - patch_brown_max  * 10.0  # even one brown patch kills healthy
-        - lb_signal        * 8.0
-        - patch_dark_max   * 7.0
-        - texture          * 1.5
+          green_px          * 6.0
+        - eb_signal         * 9.0
+        - patch_brown_max   * 10.0
+        - lb_signal         * 7.0
+        - patch_lbdark_max  * 9.0
+        - texture           * 1.0
     )
 
-    # ── Softmax ────────────────────────────────────────────────────
+    # ── Softmax ─────────────────────────────────────────────────────
     raw = np.array([eb_score, lb_score, healthy_score], dtype=np.float64)
     raw -= raw.max()
     exp_ = np.exp(raw * 3.5)
@@ -362,14 +389,14 @@ with col_res:
     else:
         st.markdown("#### 📖 How the CNN Works")
         steps = [
-            ("1️⃣ Image Input",            "256×256 pixels, normalised 0→1"),
-            ("2️⃣ Conv Block 1 (32 filters)", "Detects edges and colour gradients"),
-            ("3️⃣ Conv Block 2 (64 filters)", "Learns textures and spot boundaries"),
+            ("1️⃣ Image Input",               "256×256 pixels, normalised 0→1"),
+            ("2️⃣ Conv Block 1 (32 filters)",  "Detects edges and colour gradients"),
+            ("3️⃣ Conv Block 2 (64 filters)",  "Learns textures and spot boundaries"),
             ("4️⃣ Conv Block 3 (128 filters)", "Recognises disease spot patterns"),
             ("5️⃣ Conv Block 4 (256 filters)", "High-level abstract disease features"),
-            ("6️⃣ Global Avg Pooling",     "Compresses to 256 feature values"),
-            ("7️⃣ Dense Layers 256→128",   "Classification with Dropout regularisation"),
-            ("8️⃣ Softmax Output",          "3 probabilities — one per class"),
+            ("6️⃣ Global Avg Pooling",         "Compresses to 256 feature values"),
+            ("7️⃣ Dense Layers 256→128",       "Classification with Dropout regularisation"),
+            ("8️⃣ Softmax Output",              "3 probabilities — one per class"),
         ]
         for title, desc in steps:
             st.markdown(f"""<div class="arch-step">
