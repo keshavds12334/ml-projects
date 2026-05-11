@@ -39,50 +39,58 @@ div[data-testid="stSidebar"]{ background:#071407;border-right:1px solid rgba(0,2
 """, unsafe_allow_html=True)
 
 
-# ── FIXED PREDICTION ENGINE ──────────────────────────────────────────
+# ── SPOT-AWARE PREDICTION ENGINE ─────────────────────────────────────
 def predict_disease(image: Image.Image):
     """
-    Improved colour + texture classifier for potato leaf disease.
-    Fixes: green-bias bug, recalibrated thresholds, balanced scoring.
+    Spot-aware classifier.
 
-    Classes:
-      - Healthy:      bright green dominant, uniform, low texture
-      - Early Blight: brown/reddish spots (R > G > B), yellow halos, medium texture
-      - Late Blight:  very dark water-soaked areas, high local contrast
+    ROOT CAUSE of old bug: a leaf can be 80%+ green yet still have Early
+    Blight. Global pixel averages let green dominate and drown out the
+    brown spot signal. Fix: use PATCH-LEVEL max detection — even a small
+    cluster of brown pixels (one 16×16 patch that is >30% brown) is
+    enough to flag disease.
+
+    Pipeline:
+      1. Global pixel ratios  (broad signal)
+      2. Patch-level max      (spot presence — KEY addition)
+      3. Healthy score has heavy penalty for ANY brown/dark patches
+      4. Softmax with temperature=3.5 for sharp separation
     """
     img = image.resize((256, 256)).convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
 
-    R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    R, G, B    = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
     brightness = (R + G + B) / 3.0
 
-    # ── Core pixel-level features ──────────────────────────────────
+    # ── Global features ────────────────────────────────────────────
 
-    # GREEN: strict — G must clearly dominate both R and B
-    green_px = float(
-        ((G > R + 0.05) & (G > B + 0.05) &
-         (brightness > 0.20) & (brightness < 0.80)).mean()
+    # Brown pixels: R is clearly highest, B is clearly lowest
+    brown_mask = (
+        (R > G + 0.03) & (R > B + 0.08) &
+        (brightness > 0.15) & (brightness < 0.75)
     )
+    brown_px = float(brown_mask.mean())
 
-    # BROWN: classic early blight — reddish-brown spots (R highest, B lowest)
-    brown_px = float(
-        ((R > G + 0.04) & (R > B + 0.10) &
-         (brightness > 0.18) & (brightness < 0.72)).mean()
+    # Yellow halo pixels: Early Blight ring around spots
+    yellow_mask = (
+        (R > 0.42) & (G > 0.38) & (B < 0.32) &
+        (R > B + 0.15) & (G > B + 0.10)
     )
+    yellow_px = float(yellow_mask.mean())
 
-    # YELLOW HALO: ring around early blight spots
-    yellow_px = float(
-        ((R > 0.45) & (G > 0.40) & (B < 0.30) &
-         (R > B + 0.18) & (G > B + 0.12)).mean()
-    )
+    # Combined Early Blight global signal
+    eb_signal = brown_px + yellow_px * 0.5
 
-    # DARK / WATER-SOAKED: late blight signature — very dark pixels
-    dark_px = float((brightness < 0.25).mean())
+    # Dark / water-soaked pixels: Late Blight
+    dark_px      = float((brightness < 0.22).mean())
+    very_dark_px = float((brightness < 0.12).mean())
+    lb_signal    = dark_px + very_dark_px * 0.5
 
-    # VERY DARK: extreme late blight (near-black lesions)
-    very_dark_px = float((brightness < 0.15).mean())
+    # Green pixels: Healthy
+    green_mask = (G > R + 0.04) & (G > B + 0.04) & (brightness > 0.18)
+    green_px   = float(green_mask.mean())
 
-    # ── Texture: local patch standard deviation ────────────────────
+    # Texture
     patches = [
         arr[y:y + 32, x:x + 32].std()
         for y in range(0, 224, 32)
@@ -90,56 +98,59 @@ def predict_disease(image: Image.Image):
     ]
     texture = float(np.mean(patches))
 
-    # ── ROI (centre of leaf) variance ──────────────────────────────
-    roi = arr[64:192, 64:192, :]
-    roi_var = float(roi.std())
-
-    # ── Channel means ──────────────────────────────────────────────
-    mean_r = float(R.mean())
-    mean_g = float(G.mean())
-    mean_b = float(B.mean())
-
-    # True green dominance: G leads BOTH channels (fixes the old max() bias bug)
-    green_lead = max(0.0, mean_g - mean_r) + max(0.0, mean_g - mean_b)
-
-    # Red/brown dominance: R leads both channels
-    red_lead = max(0.0, mean_r - mean_g) + max(0.0, mean_r - mean_b)
+    # ── Patch-level spot detection (KEY FIX) ───────────────────────
+    # Scan every 16×16 patch. Record the MAXIMUM brown ratio and dark
+    # ratio found in any single patch. This catches localised spots
+    # that global averaging would dilute away.
+    patch_brown_max = 0.0
+    patch_dark_max  = 0.0
+    for y in range(0, 240, 16):
+        for x in range(0, 240, 16):
+            p  = arr[y:y+16, x:x+16]
+            pr, pg, pb = p[:,:,0], p[:,:,1], p[:,:,2]
+            pb_bright  = (pr + pg + pb) / 3.0
+            p_brown = float(
+                ((pr > pg + 0.03) & (pr > pb + 0.08) &
+                 (pb_bright > 0.15) & (pb_bright < 0.75)).mean()
+            )
+            p_dark = float((pb_bright < 0.22).mean())
+            if p_brown > patch_brown_max:
+                patch_brown_max = p_brown
+            if p_dark > patch_dark_max:
+                patch_dark_max = p_dark
 
     # ── Class scores ───────────────────────────────────────────────
-    healthy_score = (
-          green_px   * 6.0
-        + green_lead * 5.0
-        - brown_px   * 7.0
-        - yellow_px  * 4.0
-        - dark_px    * 6.0
-        - texture    * 2.0
-        - red_lead   * 4.0
-    )
 
     eb_score = (
-          brown_px   * 8.0
-        + yellow_px  * 5.0
-        + red_lead   * 4.0
-        + texture    * 2.0
-        - green_px   * 5.0
-        - dark_px    * 2.0
-        - green_lead * 3.0
+          eb_signal        * 6.0
+        + patch_brown_max  * 8.0   # local spot presence
+        + texture          * 1.5
+        - green_px         * 2.0
+        - lb_signal        * 1.5
     )
 
     lb_score = (
-          dark_px      * 8.0
-        + very_dark_px * 6.0
-        + roi_var      * 4.0
-        + texture      * 2.5
-        - green_px     * 6.0
-        - green_lead   * 4.0
-        - brown_px     * 1.5
+          lb_signal        * 7.0
+        + patch_dark_max   * 6.0
+        + texture          * 2.0
+        - green_px         * 3.0
+        - eb_signal        * 1.0
     )
 
-    # ── Softmax with temperature scaling ───────────────────────────
+    # Healthy is penalised hard by ANY patch-level disease signal
+    healthy_score = (
+          green_px         * 5.0
+        - eb_signal        * 9.0
+        - patch_brown_max  * 10.0  # even one brown patch kills healthy
+        - lb_signal        * 8.0
+        - patch_dark_max   * 7.0
+        - texture          * 1.5
+    )
+
+    # ── Softmax ────────────────────────────────────────────────────
     raw = np.array([eb_score, lb_score, healthy_score], dtype=np.float64)
-    raw -= raw.max()                  # numerical stability
-    exp_ = np.exp(raw * 3.0)         # sharper class separation
+    raw -= raw.max()
+    exp_ = np.exp(raw * 3.5)
     probs = exp_ / exp_.sum()
     probs = np.clip(probs, 0.01, 0.97)
     probs = probs / probs.sum()
@@ -262,13 +273,11 @@ with col_res:
 
         confidence = float(max(probs))
 
-        # Maps
         card_map = {"Healthy": "healthy-card", "Early Blight": "eb-card", "Late Blight": "lb-card"}
         name_map = {"Healthy": "healthy-name", "Early Blight": "eb-name", "Late Blight": "lb-name"}
         icon_map = {"Healthy": "✅", "Early Blight": "⚠️", "Late Blight": "🚨"}
         col_map  = {"Healthy": "#00e676", "Early Blight": "#ff9800", "Late Blight": "#f44336"}
 
-        # Result card
         st.markdown(f"""<div class="{card_map[pred_class]}">
             <div style="font-size:2.5rem">{icon_map[pred_class]}</div>
             <div class="disease-name {name_map[pred_class]}">{pred_class}</div>
@@ -282,7 +291,6 @@ with col_res:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Probability bars — sorted highest to lowest
         st.markdown("**All Class Probabilities:**")
         for cls, prob in sorted(zip(classes, probs), key=lambda x: -x[1]):
             w   = int(prob * 100)
@@ -298,7 +306,6 @@ with col_res:
                 </div>
             </div>""", unsafe_allow_html=True)
 
-        # Confidence quality badge
         if confidence > 0.75:
             conf_label, conf_col = "🟢 High Confidence", "#00e676"
         elif confidence > 0.55:
@@ -317,7 +324,6 @@ with col_res:
             </span>
         </div>""", unsafe_allow_html=True)
 
-        # Disease information card
         st.markdown("---")
         disease_info = {
             "Early Blight": (
@@ -377,12 +383,12 @@ st.markdown("---")
 st.markdown("#### 🔄 Training Augmentations Applied")
 aug_cols = st.columns(6)
 for col, (icon, name, val) in zip(aug_cols, [
-    ("🔃", "Rotation",  "±25°"),
-    ("↔️", "H-Flip",    "Left/Right"),
-    ("🔍", "Zoom",      "±20%"),
-    ("✂️", "Shift",     "±15%"),
-    ("☀️", "Brightness","±20%"),
-    ("🎨", "Normalize", "÷255"),
+    ("🔃", "Rotation",   "±25°"),
+    ("↔️", "H-Flip",     "Left/Right"),
+    ("🔍", "Zoom",       "±20%"),
+    ("✂️", "Shift",      "±15%"),
+    ("☀️", "Brightness", "±20%"),
+    ("🎨", "Normalize",  "÷255"),
 ]):
     with col:
         st.markdown(f"""<div style="background:rgba(0,230,118,0.04);
